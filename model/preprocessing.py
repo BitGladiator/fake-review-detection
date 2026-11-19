@@ -1,6 +1,6 @@
 """
-preprocessing.py — Text preprocessing pipeline for Fake Review Detection.
-
+preprocessing.py — Fake Review Detection
+Text cleaning, behavioral feature extraction, TF-IDF build, artifact I/O.
 """
 
 import re
@@ -14,377 +14,383 @@ import numpy as np
 import pandas as pd
 import scipy.sparse
 import joblib
-
 import nltk
+
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
-from nltk.tokenize import word_tokenize
-
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-
-
-def _nltk_download(resource: str, kind: str = "corpora") -> None:
-    """Download an NLTK resource quietly, ignoring errors if already present."""
+for _resource in ("stopwords", "punkt", "punkt_tab", "vader_lexicon"):
     try:
-        nltk.download(resource, quiet=True)
-    except Exception as exc: 
-        logger.warning("NLTK download failed for '%s': %s", resource, exc)
-
-
-_nltk_download("stopwords", kind="corpora")
-_nltk_download("punkt", kind="tokenizers")
-_nltk_download("punkt_tab", kind="tokenizers")
+        nltk.download(_resource, quiet=True)
+    except Exception as _e:
+        logger.warning("NLTK download failed for %s: %s", _resource, _e)
 
 try:
     _STOPWORDS = set(stopwords.words("english"))
-except Exception:  
-    logger.warning("Could not load NLTK stopwords; using empty set.")
+except Exception:
     _STOPWORDS = set()
-
-
 
 
 
 class TextPreprocessor:
     """
-    Cleans raw review text and extracts lightweight auxiliary features.
-
-    Parameters
-    ----------
-    stemming : bool
-        Apply Porter stemming after tokenisation.
-    remove_stopwords : bool
-        Remove English stop-words during cleaning.
+    Cleans raw review text and extracts an 11-column dense auxiliary feature
+    array.  Behavioral aggregates (product means, burst counts) are fitted on
+    training data only via fit_transform(); transform() re-uses them.
     """
 
-    def __init__(self, stemming: bool = True, remove_stopwords: bool = True) -> None:
+    def __init__(self, stemming: bool = True, remove_stopwords: bool = True):
         self.stemming = stemming
         self.remove_stopwords = remove_stopwords
         self._stemmer = PorterStemmer() if stemming else None
+        self._sia = SentimentIntensityAnalyzer()
 
 
-
+        self.product_mean_rating_: dict = {}
+        self.product_review_count_: dict = {}
+        self.daily_burst_count_: dict = {}
+        self.global_mean_rating_: float = 3.0
+        self.global_review_count_: float = 0.0
+        self.global_burst_count_: float = 0.0
 
 
     def _clean_text(self, text: str) -> str:
-        """
-        Return a cleaned version of *text*.
-
-        Steps (in order):
-          1. Lower-case
-          2. Remove URLs  (http / https / www)
-          3. Remove HTML tags
-          4. Remove e-mail addresses
-          5. Keep exclamation marks  (they are fraud signals)
-          6. Remove all other punctuation
-          7. Optionally remove stop-words and/or apply stemming
-          8. Collapse extra whitespace
-        """
         if not isinstance(text, str):
-            text = str(text) if text is not None else ""
-
-
+            text = str(text) if text else ""
         text = text.lower()
-
-
         text = re.sub(r"https?://\S+|www\.\S+", " ", text)
-
-
         text = re.sub(r"<[^>]+>", " ", text)
-
-
         text = re.sub(r"\S+@\S+\.\S+", " ", text)
-
-
-
         punct_no_excl = string.punctuation.replace("!", "")
-        translator = str.maketrans(punct_no_excl, " " * len(punct_no_excl))
-        text = text.translate(translator)
-
-
+        text = text.translate(str.maketrans(punct_no_excl, " " * len(punct_no_excl)))
         tokens = text.split()
         if self.remove_stopwords:
             tokens = [t for t in tokens if t not in _STOPWORDS]
-        if self.stemming and self._stemmer is not None:
+        if self.stemming and self._stemmer:
             tokens = [self._stemmer.stem(t) for t in tokens]
+        return re.sub(r"\s+", " ", " ".join(tokens)).strip()
 
 
-        text = " ".join(tokens)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
+    def _fit_behavioral_aggregates(self, df: pd.DataFrame) -> None:
+        """Fit lookup dicts from TRAINING data only."""
+        if df is None:
+            return
 
-    def _extract_auxiliary_features(
-        self,
-        texts: pd.Series,
-        ratings: pd.Series = None,
+        has_pid = "product_id" in df.columns
+        has_rating = "rating" in df.columns
+        has_date = "review_date" in df.columns
+
+        if has_rating:
+            self.global_mean_rating_ = float(
+                pd.to_numeric(df["rating"], errors="coerce").fillna(3.0).mean()
+            )
+
+        if has_pid and has_rating:
+            grp = df.groupby("product_id")
+            self.product_mean_rating_ = grp.apply(
+                lambda g: pd.to_numeric(g["rating"], errors="coerce").fillna(3.0).mean()
+            ).to_dict()
+            counts = grp.size()
+            self.product_review_count_ = np.log1p(counts).to_dict()
+            self.global_review_count_ = float(np.log1p(counts.mean()))
+
+        if has_pid and has_date:
+            date_str = (
+                pd.to_datetime(df["review_date"], errors="coerce")
+                .dt.strftime("%Y-%m-%d")
+                .fillna("unknown")
+            )
+            burst = df.groupby(["product_id", date_str]).size()
+            self.daily_burst_count_ = {
+                str(k): float(np.log1p(v)) for k, v in burst.items()
+            }
+            self.global_burst_count_ = (
+                float(np.log1p(burst.mean())) if len(burst) > 0 else 0.0
+            )
+
+
+    def _extract_behavioral_features(
+        self, texts: pd.Series, df=None
     ) -> np.ndarray:
         """
-        Build a (n_samples, 5) float32 numpy array from *raw* texts.
-
-        Returned as a plain ndarray (only 5 columns — negligible memory).
-        ``build_features`` handles scaling and sparse conversion so that
-        .toarray() / .todense() are never called on any large matrix.
-
-        Features
-        --------
-        0  char_length       — total character count
-        1  word_count        — whitespace-delimited token count
-        2  exclamation_count — number of '!' characters
-        3  uppercase_ratio   — fraction of alphabetic chars that are uppercase
-        4  rating            — star rating (0.0 if not provided)
+        Returns np.ndarray shape (n, 11) float32.
+        ALWAYS dense — only 11 columns, StandardScaler works directly on it.
         """
-        char_lengths = texts.str.len().fillna(0).values.astype(np.float32)
-        word_counts = texts.str.split().str.len().fillna(0).values.astype(np.float32)
-        excl_counts = texts.str.count(r"!").fillna(0).values.astype(np.float32)
+        n = len(texts)
 
-        def _uppercase_ratio(s: str) -> float:
-            if not isinstance(s, str) or len(s) == 0:
+
+        char_len = texts.str.len().fillna(0).values.astype(np.float32)
+        word_cnt = texts.str.split().str.len().fillna(0).values.astype(np.float32)
+        excl_cnt = texts.str.count("!").fillna(0).values.astype(np.float32)
+
+        _FP = {"i", "me", "my", "mine", "myself"}
+
+        def _upr(s: str) -> float:
+            if not isinstance(s, str) or not s:
                 return 0.0
             alpha = [c for c in s if c.isalpha()]
-            if not alpha:
-                return 0.0
-            return sum(1 for c in alpha if c.isupper()) / len(alpha)
+            return sum(1 for c in alpha if c.isupper()) / max(len(alpha), 1)
 
-        upper_ratios = np.array(
-            [_uppercase_ratio(t) for t in texts], dtype=np.float32
+        def _fpr(s: str) -> float:
+            if not isinstance(s, str) or not s:
+                return 0.0
+            w = s.lower().split()
+            return sum(1 for x in w if x in _FP) / max(len(w), 1)
+
+        upr = np.array([_upr(t) for t in texts], dtype=np.float32)
+        fpr = np.array([_fpr(t) for t in texts], dtype=np.float32)
+
+
+        if df is not None and "rating" in df.columns:
+            rating = (
+                pd.to_numeric(df["rating"], errors="coerce")
+                .fillna(3.0)
+                .values.astype(np.float32)
+            )
+        else:
+            rating = np.full(n, 3.0, dtype=np.float32)
+
+
+        if df is not None and "product_id" in df.columns:
+            pids = df["product_id"].values
+            prod_means = np.array(
+                [
+                    self.product_mean_rating_.get(p, self.global_mean_rating_)
+                    for p in pids
+                ],
+                dtype=np.float32,
+            )
+            rat_dev = np.abs(rating - prod_means)
+            prod_cnt = np.array(
+                [
+                    self.product_review_count_.get(p, self.global_review_count_)
+                    for p in pids
+                ],
+                dtype=np.float32,
+            )
+        else:
+            rat_dev = np.zeros(n, dtype=np.float32)
+            prod_cnt = np.full(n, self.global_review_count_, dtype=np.float32)
+
+        extreme = ((rating == 1.0) | (rating == 5.0)).astype(np.float32)
+
+
+        if (
+            df is not None
+            and "product_id" in df.columns
+            and "review_date" in df.columns
+        ):
+            date_strs = (
+                pd.to_datetime(df["review_date"], errors="coerce")
+                .dt.strftime("%Y-%m-%d")
+                .fillna("unknown")
+                .values
+            )
+            pids_b = df["product_id"].values
+            burst = np.array(
+                [
+                    self.daily_burst_count_.get(
+                        str((p, d)), self.global_burst_count_
+                    )
+                    for p, d in zip(pids_b, date_strs)
+                ],
+                dtype=np.float32,
+            )
+        else:
+            burst = np.full(n, self.global_burst_count_, dtype=np.float32)
+
+
+        def _sent_mismatch(text, r: float) -> float:
+            try:
+                compound = self._sia.polarity_scores(str(text))["compound"]
+                scaled = (compound + 1) / 2 * 4 + 1  # [1, 5]
+                return float(abs(scaled - r))
+            except Exception:
+                return 0.0
+
+        sent = np.array(
+            [_sent_mismatch(t, r) for t, r in zip(texts, rating)],
+            dtype=np.float32,
         )
 
-        if ratings is not None:
-            rating_vals = ratings.fillna(0.0).values.astype(np.float32)
-        else:
-            rating_vals = np.zeros(len(texts), dtype=np.float32)
 
-      
         return np.column_stack(
-            [char_lengths, word_counts, excl_counts, upper_ratios, rating_vals]
-        ).astype(np.float32)  
+            [char_len, word_cnt, excl_cnt, upr, fpr, rating,
+             rat_dev, extreme, prod_cnt, burst, sent]
+        ).astype(np.float32)
 
-   
 
-    def fit_transform(
-        self,
-        texts: pd.Series,
-        ratings: pd.Series = None,
-    ) -> tuple:
+    def fit_transform(self, texts: pd.Series, df=None):
         """
-        Fit (stateless here) and transform raw texts.
+        Fit behavioral aggregates on training data, then clean + extract.
 
         Returns
         -------
-        cleaned_texts : pd.Series
-        aux_features  : np.ndarray, shape (n, 5), dtype float32
+        cleaned : pd.Series
+        aux     : np.ndarray (n, 11)
         """
-        # Auxiliary features MUST be computed on the ORIGINAL texts
-        aux_features = self._extract_auxiliary_features(texts, ratings)
-
-        logger.info("Cleaning %d texts…", len(texts))
-        t0 = time.time()
-        cleaned_texts = texts.apply(self._clean_text)
-        logger.info("Text cleaning done in %.1fs", time.time() - t0)
-
+        if df is not None:
+            self._fit_behavioral_aggregates(df)
+        aux = self._extract_behavioral_features(texts, df)
+        cleaned = texts.apply(self._clean_text)
         gc.collect()
-        return cleaned_texts, aux_features
+        return cleaned, aux
 
-    def transform(
-        self,
-        texts: pd.Series,
-        ratings: pd.Series = None,
-    ) -> tuple:
+    def transform(self, texts: pd.Series, df=None):
         """
-        Transform raw texts (stateless — identical to fit_transform).
+        Apply pre-fitted aggregates to new data.
 
         Returns
         -------
-        cleaned_texts : pd.Series
-        aux_features  : np.ndarray, shape (n, 5), dtype float32
+        cleaned : pd.Series
+        aux     : np.ndarray (n, 11)
         """
-        return self.fit_transform(texts, ratings)
-
+        aux = self._extract_behavioral_features(texts, df)
+        cleaned = texts.apply(self._clean_text)
+        gc.collect()
+        return cleaned, aux
 
 
 
 def build_features(
     cleaned_texts,
-    aux_features: np.ndarray,
-    vectorizer: TfidfVectorizer,
-    scaler: StandardScaler = None,
+    aux_features,
+    word_vectorizer: TfidfVectorizer,
+    char_vectorizer: TfidfVectorizer,
+    scaler: StandardScaler,
     is_train: bool = True,
 ) -> scipy.sparse.csr_matrix:
     """
-    Combine TF-IDF and auxiliary features into a single sparse CSR matrix.
+    Combine word TF-IDF + char TF-IDF + scaled auxiliary features into one
+    sparse CSR matrix.
 
     Parameters
     ----------
-    cleaned_texts : array-like of str
-        Already-cleaned review texts.
-    aux_features : np.ndarray, shape (n, 5)
-        Dense auxiliary features from TextPreprocessor._extract_auxiliary_features.
-        Kept as a plain ndarray (only 5 cols) so StandardScaler can be applied
-        directly — no .toarray() / .todense() calls ever needed on large matrices.
-    vectorizer : TfidfVectorizer
-        Must have dtype=np.float32 to avoid dense conversions.
-    scaler : StandardScaler or None
-        If provided, scales aux_features (fit on train, transform on both).
-    is_train : bool
-        True → fit vectorizer (and scaler) first; False → transform only.
+    cleaned_texts   : pd.Series of cleaned strings
+    aux_features    : np.ndarray (n, 11) — dense, StandardScaler works directly
+    word_vectorizer : TfidfVectorizer (word n-grams)
+    char_vectorizer : TfidfVectorizer (char n-grams)
+    scaler          : StandardScaler for the aux array
+    is_train        : if True, fit vectorizers + scaler; else only transform
 
     Returns
     -------
-    combined : csr_matrix, shape (n, tfidf_features + 5)
-        Fully sparse; .toarray() / .todense() are never called.
+    scipy.sparse.csr_matrix, float32
     """
     if is_train:
-        logger.info("Fitting TF-IDF vectorizer on %d documents…", len(cleaned_texts))
-        vectorizer.fit(cleaned_texts)
+        logger.info("Fitting word TF-IDF on %d docs...", len(cleaned_texts))
+        word_vectorizer.fit(cleaned_texts)
+        logger.info("Fitting char TF-IDF on %d docs...", len(cleaned_texts))
+        char_vectorizer.fit(cleaned_texts)
 
-    tfidf_matrix = vectorizer.transform(cleaned_texts)  
+    word_mat = word_vectorizer.transform(cleaned_texts)
+    char_mat = char_vectorizer.transform(cleaned_texts)
 
-   
-    if tfidf_matrix.dtype != np.float32:
-        tfidf_matrix = tfidf_matrix.astype(np.float32)
+    if word_mat.dtype != np.float32:
+        word_mat = word_mat.astype(np.float32)
+    if char_mat.dtype != np.float32:
+        char_mat = char_mat.astype(np.float32)
+    gc.collect()
 
-   
-    if scaler is not None:
-        aux_arr = np.asarray(aux_features, dtype=np.float32)  
-        if is_train:
-            logger.info("Fitting StandardScaler on auxiliary features…")
-            scaled_aux = scaler.fit_transform(aux_arr)
-        else:
-            scaled_aux = scaler.transform(aux_arr)
-        sparse_aux = scipy.sparse.csr_matrix(scaled_aux.astype(np.float32))
+
+    aux_arr = np.asarray(aux_features, dtype=np.float32)
+    if is_train:
+        scaled_aux = scaler.fit_transform(aux_arr)
     else:
-        sparse_aux = scipy.sparse.csr_matrix(
-            np.asarray(aux_features, dtype=np.float32)
-        )
+        scaled_aux = scaler.transform(aux_arr)
 
-    combined = scipy.sparse.hstack([tfidf_matrix, sparse_aux], format="csr")
+
+    sparse_aux = scipy.sparse.csr_matrix(scaled_aux.astype(np.float32))
+
+    combined = scipy.sparse.hstack([word_mat, char_mat, sparse_aux], format="csr")
     logger.info(
         "Combined feature matrix: shape=%s, nnz=%d", combined.shape, combined.nnz
     )
-
     gc.collect()
     return combined
 
 
 
-
 def save_preprocessor(
     preprocessor: TextPreprocessor,
-    vectorizer: TfidfVectorizer,
+    word_vectorizer: TfidfVectorizer,
+    char_vectorizer: TfidfVectorizer,
     scaler: StandardScaler,
     output_dir: str,
 ) -> None:
-    """
-    Persist the preprocessing artefacts to *output_dir*.
-
-    Files written
-    -------------
-    text_preprocessor.joblib
-    vectorizer.joblib
-    scaler.joblib
-    """
+    """Persist all preprocessing artifacts to *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
-
-    paths = {
+    artifacts = {
         "text_preprocessor.joblib": preprocessor,
-        "vectorizer.joblib": vectorizer,
+        "word_vectorizer.joblib": word_vectorizer,
+        "char_vectorizer.joblib": char_vectorizer,
         "scaler.joblib": scaler,
     }
-
-    for filename, obj in paths.items():
-        dest = os.path.join(output_dir, filename)
+    for fname, obj in artifacts.items():
+        dest = os.path.join(output_dir, fname)
         joblib.dump(obj, dest, compress=3)
-        size_kb = os.path.getsize(dest) / 1024
-        print(f"  Saved {filename:35s}  ({size_kb:>8.1f} KB)  →  {dest}")
-
-    logger.info("All preprocessing artefacts saved to '%s'.", output_dir)
+        print(f"  Saved {fname} ({os.path.getsize(dest) / 1024:.1f} KB)")
 
 
-def load_preprocessor(artifact_dir: str) -> tuple:
+def load_preprocessor(artifact_dir: str):
     """
-    Load and return (preprocessor, vectorizer, scaler) from *artifact_dir*.
+    Load all preprocessing artifacts from *artifact_dir*.
+
+    Returns
+    -------
+    (preprocessor, word_vectorizer, char_vectorizer, scaler)
     """
-    preprocessor = joblib.load(os.path.join(artifact_dir, "text_preprocessor.joblib"))
-    vectorizer = joblib.load(os.path.join(artifact_dir, "vectorizer.joblib"))
+    preprocessor = joblib.load(
+        os.path.join(artifact_dir, "text_preprocessor.joblib")
+    )
+    word_vectorizer = joblib.load(
+        os.path.join(artifact_dir, "word_vectorizer.joblib")
+    )
+    char_vectorizer = joblib.load(
+        os.path.join(artifact_dir, "char_vectorizer.joblib")
+    )
     scaler = joblib.load(os.path.join(artifact_dir, "scaler.joblib"))
-    logger.info("Preprocessing artefacts loaded from '%s'.", artifact_dir)
-    return preprocessor, vectorizer, scaler
+    return preprocessor, word_vectorizer, char_vectorizer, scaler
+
+
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  Fake Review Detection — Preprocessing Demo")
-    print("=" * 60)
+    print("=== Preprocessing Demo ===")
 
     sample_texts = pd.Series(
         [
-            "This restaurant is AMAZING!!! Best food EVER! Highly recommend!!!",
-            "Terrible experience. The staff was rude and food was cold.",
-            "Visit http://www.spam-link.com for great deals! <b>Click now</b>",
+            "AMAZING food! Best place EVER!!! Must visit!!!",
+            "Decent place, nothing special. Food was ok.",
+            "Visit http://spam.com for deals! <b>Click now</b>",
         ]
     )
-    sample_ratings = pd.Series([5.0, 1.0, 5.0])
-
-
-    preprocessor = TextPreprocessor(stemming=True, remove_stopwords=True)
-
-    
-    cleaned, aux = preprocessor.fit_transform(sample_texts, sample_ratings)
-    print("\n--- Cleaned texts ---")
-    for i, t in enumerate(cleaned):
-        print(f"  [{i}] {t!r}")
-    print(f"\nAuxiliary features shape : {aux.shape}")
-    print(f"Auxiliary features dtype : {aux.dtype}")
-    print(f"Is sparse                : {scipy.sparse.issparse(aux)}")
-
-  
-    vectorizer = TfidfVectorizer(
-        max_features=5000,
-        ngram_range=(1, 2),
-        sublinear_tf=True,
-        dtype=np.float32,
+    sample_df = pd.DataFrame(
+        {
+            "rating": [5.0, 3.0, 5.0],
+            "product_id": [1, 2, 1],
+            "review_date": ["2020-01-01", "2020-01-01", "2020-01-01"],
+        }
     )
-    scaler = StandardScaler()
 
-    combined = build_features(
-        cleaned,
-        aux,
-        vectorizer=vectorizer,
-        scaler=scaler,
-        is_train=True,
+    preprocessor = TextPreprocessor()
+    cleaned, aux = preprocessor.fit_transform(sample_texts, sample_df)
+    print("Cleaned:", cleaned.tolist())
+    print("Aux shape:", aux.shape)
+
+
+    word_vec = TfidfVectorizer(max_features=100, ngram_range=(1, 2), dtype=np.float32)
+    char_vec = TfidfVectorizer(
+        max_features=100, analyzer="char_wb", ngram_range=(3, 4), dtype=np.float32
     )
-    print(f"\nCombined feature matrix shape : {combined.shape}")
-    print(f"Combined feature matrix dtype : {combined.dtype}")
-    print(f"Is sparse                     : {scipy.sparse.issparse(combined)}")
-
-  
-    cleaned_test, aux_test = preprocessor.transform(sample_texts, sample_ratings)
-    combined_test = build_features(
-        cleaned_test,
-        aux_test,
-        vectorizer=vectorizer,
-        scaler=scaler,
-        is_train=False,
-    )
-    print(f"\nTest combined matrix shape    : {combined_test.shape}")
-
-   
-    _demo_dir = "/tmp/fake_review_preproc_demo"
-    save_preprocessor(preprocessor, vectorizer, scaler, _demo_dir)
-    p2, v2, s2 = load_preprocessor(_demo_dir)
-    print(f"\nLoaded preprocessor type : {type(p2).__name__}")
-    print(f"Loaded vectorizer type   : {type(v2).__name__}")
-    print(f"Loaded scaler type       : {type(s2).__name__}")
-
-    print("\n Preprocessing demo complete.")
+    scaler_obj = StandardScaler()
+    X = build_features(cleaned, aux, word_vec, char_vec, scaler_obj, is_train=True)
+    print("Feature matrix shape:", X.shape, "| type:", type(X).__name__)
+    print("Demo complete.")
