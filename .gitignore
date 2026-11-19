@@ -2,3 +2,4 @@ model/data/raw/*.xlsx
 venv
 model/data/processed/
 model/artifacts/*.joblib
+model/artifacts/
